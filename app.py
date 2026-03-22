@@ -1,75 +1,109 @@
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
-import os
-import zipfile
-import io
-import csv
+import os, zipfile, io, csv
+import fitz
+from PIL import Image
 
 st.set_page_config(page_title="Drawing Manager", layout="wide")
-st.title("Drawing Manager")
+st.title("🗂️ Drawing Manager")
 
 tab1, tab2 = st.tabs(["Split PDF", "Library"])
 
 with tab1:
     st.header("Split PDF by Catalog Number")
-
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-    csv_file = st.file_uploader("Load catalog mapping (CSV)", type="csv")
+    uploaded_file = st.file_uploader("העלה קובץ PDF", type="pdf")
 
     if uploaded_file:
-        reader = PdfReader(uploaded_file)
+        file_bytes = uploaded_file.getvalue()
+
+        # Reset catalog numbers when a new file is uploaded
+        file_id = uploaded_file.name + str(uploaded_file.size)
+        if st.session_state.get("current_file_id") != file_id:
+            st.session_state.current_file_id = file_id
+            st.session_state.catalog_numbers = {}
+
+        reader = PdfReader(io.BytesIO(file_bytes))
         num_pages = len(reader.pages)
-        st.info(f"Found {num_pages} pages")
+        st.info(f"נמצאו {num_pages} עמודים")
 
-        catalog_numbers = {}
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        st.subheader("הזן מק\"ט לכל שרטוט:")
 
-        if csv_file:
-            content = csv_file.read().decode("utf-8").splitlines()
-            reader_csv = csv.DictReader(content)
-            for row in reader_csv:
-                page_idx = int(row["page"]) - 1
-                catalog_numbers[page_idx] = row["catalog"]
-            st.success(f"Loaded {len(catalog_numbers)} catalog numbers from CSV")
+        for i in range(num_pages):
+            page = doc[i]
+            rect = page.rect
+            w, h = rect.width, rect.height
 
-        if st.button("Split and Download", type="primary"):
-            if not catalog_numbers:
-                st.error("No catalog numbers loaded - please upload CSV file")
-            else:
+            # Crop bottom-right corner (title block)
+            crop = fitz.Rect(w * 0.50, h * 0.75, w, h)
+            mat = fitz.Matrix(2, 2)
+            clip = page.get_pixmap(matrix=mat, clip=crop)
+            img = Image.frombytes("RGB", [clip.width, clip.height], clip.samples)
+
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.image(img, caption=f"עמוד {i+1} — פינת הכותרת", use_container_width=True)
+            with col2:
+                st.write(f"**עמוד {i+1}**")
+                val = st.session_state.catalog_numbers.get(i, "")
+                catalog = st.text_input(
+                    f"מק\"ט שרטוט:",
+                    value=val,
+                    key=f"cat_{i}",
+                    placeholder="למשל: 20995352132"
+                )
+                if catalog:
+                    st.session_state.catalog_numbers[i] = catalog
+                    st.success(f"✅ {catalog}")
+
+        doc.close()
+
+        filled = {k: v for k, v in st.session_state.catalog_numbers.items() if v.strip()}
+        st.divider()
+        st.write(f"**{len(filled)} / {num_pages} מק\"טים הוזנו**")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            if filled:
+                csv_buffer = io.StringIO()
+                writer_csv = csv.writer(csv_buffer)
+                writer_csv.writerow(["page", "catalog"])
+                for page_num, catalog in sorted(filled.items()):
+                    writer_csv.writerow([page_num + 1, catalog])
+                st.download_button(
+                    label="📥 הורד CSV",
+                    data=csv_buffer.getvalue(),
+                    file_name="catalog_mapping.csv",
+                    mime="text/csv"
+                )
+
+        with col_b:
+            if st.button("✂️ Split and Download ZIP", type="primary", disabled=len(filled) == 0):
                 zip_buffer = io.BytesIO()
-                file_bytes = uploaded_file.getvalue()
-                reader2 = PdfReader(io.BytesIO(file_bytes))
+                reader3 = PdfReader(io.BytesIO(file_bytes))
                 with zipfile.ZipFile(zip_buffer, "w") as zf:
-                    for page_num, catalog in catalog_numbers.items():
+                    for page_num, catalog in filled.items():
                         writer = PdfWriter()
-                        writer.add_page(reader2.pages[page_num])
+                        writer.add_page(reader3.pages[page_num])
                         pdf_buffer = io.BytesIO()
                         writer.write(pdf_buffer)
                         zf.writestr(f"{catalog}.pdf", pdf_buffer.getvalue())
-
-                st.success(f"{len(catalog_numbers)} files ready!")
+                st.success(f"✅ {len(filled)} קבצים מוכנים!")
                 st.download_button(
-                    label="Download all as ZIP",
+                    label="📦 Download ZIP",
                     data=zip_buffer.getvalue(),
                     file_name="drawings.zip",
                     mime="application/zip"
                 )
 
-        if catalog_numbers:
-            st.subheader("Catalog numbers loaded:")
-            cols = st.columns(3)
-            for i, (page_num, catalog) in enumerate(sorted(catalog_numbers.items())):
-                col = cols[i % 3]
-                with col:
-                    st.write(f"Page {page_num+1}: **{catalog}**")
-
 with tab2:
     st.header("Drawings Library")
-
     if "library" not in st.session_state:
         st.session_state.library = {}
 
     uploaded_files = st.file_uploader(
-        "Upload drawings to library",
+        "העלה שרטוטים לספרייה",
         type="pdf",
         accept_multiple_files=True,
         key="library_upload"
@@ -79,28 +113,25 @@ with tab2:
         for f in uploaded_files:
             name = os.path.splitext(f.name)[0]
             st.session_state.library[name] = f.read()
-        st.success(f"Added {len(uploaded_files)} drawings")
+        st.success(f"נוספו {len(uploaded_files)} שרטוטים")
 
     if st.session_state.library:
-        search = st.text_input("Search by catalog number")
-
+        search = st.text_input("🔍 חפש לפי מק\"ט")
         items = list(st.session_state.library.items())
         if search:
             items = [(k, v) for k, v in items if search.lower() in k.lower()]
-
-        st.write(f"{len(items)} drawings")
-
+        st.write(f"{len(items)} שרטוטים")
         for name, data in items:
             col1, col2 = st.columns([4, 1])
             with col1:
-                st.write(f"{name}")
+                st.write(f"📄 {name}")
             with col2:
                 st.download_button(
-                    label="Download",
+                    label="הורד",
                     data=data,
                     file_name=f"{name}.pdf",
                     mime="application/pdf",
                     key=f"dl_{name}"
                 )
     else:
-        st.info("Library is empty - upload drawings above")
+        st.info("הספרייה ריקה — העלה שרטוטים למעלה")
